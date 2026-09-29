@@ -1,0 +1,336 @@
+################################################################################
+# SpoolBuddy Console — EXPERIMENTAL port to Guition JC8048W550C
+#
+# Derived from espoolbuddy_console_pandatouch.yaml (same board class: ESP32-S3,
+# octal PSRAM, 800x480 parallel RGB, GT911) — only the hardware differs. It
+# reuses espoolbuddy/app.yaml and lvgl.yaml UNCHANGED.
+#   - NFC: none yet. No bambuddy_nfc: block is declared, so bambuddy_api's
+#     has_nfc() is false and the shared UI hides the NFC-only settings — the
+#     same optional path the component already supports. A PN532 in I2C mode
+#     can later share the GT911 bus below (0x24 vs 0x5D, no clash); copy the
+#     bambuddy_nfc: block from the Panda Touch file.
+#   - No speaker. Like the Panda Touch build, speaker_id is not passed to
+#     bambuddy_api, so chimes no-op and the Sound setting hides itself.
+#   - Hardware: Guition JC8048W550C (ESP32-S3-WROOM-1 N16R8: 16MB flash, 8MB
+#     octal PSRAM, 800x480 RGB565 parallel LCD, GT911 capacitive touch,
+#     CH340 USB-UART on UART0). Pin/timing refs, cross-checked:
+#     [A] agillis/esphome-modular-lvgl-buttons hardware/guition-esp32-jc8048w550.yaml
+#         @ 103a2cfbb9af30f387ea8daacb5a38f2088872d0
+#     [B] rzeldent/platformio-espressif32-sunton JC8048W550C.json
+#         @ 661181c6166b7bdce7fba3936b9104d238cecedf
+#     [C] ESPHome 2026.9.0 built-in mipi_rgb model ESP32-8048S050
+#         (esphome/components/mipi_rgb/models/sunton.py — same PCB family)
+################################################################################
+substitutions:
+  # Branch/tag/commit fetched for the components + espoolbuddy packages
+  # below. Pin to a release tag instead of tracking main if you want
+  # reproducible builds.
+  espoolbuddy_ref: main
+  # Screen geometry consumed by espoolbuddy/lvgl.yaml's root page and
+  # lvgl: rotation — everything below the root sizes itself relative to its
+  # parent (flex/grid/pct), so these are the only resolution-specific values
+  # that need to change per console variant.
+  screen_width: "800"
+  screen_height: "480"
+  screen_rotation: "0"
+
+esphome:
+  name: espoolbuddy-console-jc8048w550c
+  friendly_name: ESPoolBuddy Console (JC8048W550C)
+  project:
+    name: espoolbuddy.console
+    # Version is centralized in espoolbuddy/version.yaml (see packages: below).
+  on_boot:
+    - priority: 600
+      then:
+        - logger.log: "SpoolBuddy booting..."
+        - lambda: bambuddy->configure_pm(false);
+    - priority: -100
+      then:
+        - script.execute: apply_tab
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  variant: ESP32S3
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
+      CONFIG_PM_ENABLE: "y"
+      CONFIG_FREERTOS_USE_TICKLESS_IDLE: "1"
+    advanced:
+      # ESPHome's own "loopTask" (esp32/core.cpp) runs setup()/App.loop() —
+      # including lv_timer_handler() and every interval lambda — on a
+      # statically-sized stack independent of ESP-IDF's main-task stack
+      # (CONFIG_ESP_MAIN_TASK_STACK_SIZE does NOT apply to it, confirmed via a
+      # real "stack overflow in task loopTask" crash). Default is 8192 B. The
+      # flex/grid UI conversion added several more nested layout: containers
+      # (AMS row -> slot -> icon stack, NFC action row, header sub-rows,
+      # settings rows), deepening LVGL's recursive layout/style recalculation
+      # on every lv_timer_handler() call enough to overflow the default.
+      loop_task_stack_size: 16384
+
+# JC8048W550C (N16R8) ships 8MB Octal PSRAM (GPIO33-37 reserved internally for it —
+# unlike the console board, which runs quad mode and frees those pins for I2S).
+psram:
+  mode: octal
+  speed: 80MHz
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/CSchlipp/espoolbuddy.git
+      ref: ${espoolbuddy_ref}
+      path: components
+    components: [bambuddy_api, bambuddy_nfc]
+    refresh: always
+
+packages:
+  espoolbuddy:
+    url: https://github.com/CSchlipp/espoolbuddy.git
+    ref: ${espoolbuddy_ref}
+    path: espoolbuddy
+    files: [version.yaml, app.yaml, assets.yaml, lvgl.yaml]
+    refresh: always
+
+logger:
+  # Global level must be DEBUG so the Bambuddy components can emit DEBUG (a
+  # per-tag level may only be RAISED above the global level, never lowered).
+  # The noisy framework tags are raised back to INFO to keep the log readable
+  # while still tracing all Bambuddy HTTP requests/responses and NFC detail.
+  # Change to DEBUG if required
+  level: INFO
+  # JC8048W550C's USB-C port goes through its CH340 bridge to UART0
+  # (GPIO43/44). ESPHome otherwise defaults ESP32-S3 logging to the native
+  # USB_SERIAL_JTAG peripheral, which is not connected to that port.
+  hardware_uart: UART0
+  baud_rate: 115200
+  logs:
+    scheduler: INFO
+    component: INFO
+    sensor: INFO
+    light: INFO
+    lvgl: INFO
+    touchscreen: INFO
+    wifi: INFO
+    api: INFO
+    ota: INFO
+    mdns: INFO
+    # ESP-IDF TLS/HTTP internals: expected errors when backend is temporarily
+    # unreachable (select timeout, connection refused). Raising to WARN keeps
+    # the log clean without hiding our own bambuddy_* DEBUG traces.
+    esp-tls: WARN
+    transport_base: WARN
+    HTTP_CLIENT: WARN
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: light
+  # Fallback hotspot: if the configured SSID can't be joined, the console comes
+  # up as its own AP so captive_portal below can serve the WiFi setup page —
+  # without this the portal is compiled in but unreachable.
+  ap:
+    ssid: "ESPoolBuddy JC8048"
+    password: !secret ap_fallback_password
+  on_connect:
+    - logger.log: "WiFi connected"
+  on_disconnect:
+    - logger.log: "WiFi disconnected"
+
+captive_portal:
+
+ota:
+  - platform: esphome
+    # No password: a bare encryption block inherits the api encryption key
+    # below, which both authenticates the uploader and encrypts the upload.
+    # Cheaper than the password handshake (~3.5 KB flash, 60 B RAM).
+    encryption:
+    # This board drives its RGB panel directly from a continuously-scanned
+    # PSRAM framebuffer; a stalled main loop during the flash write shows up
+    # as visible glitching. Blank the backlight for the duration so nothing
+    # is visible, and restore it on any outcome that doesn't reboot.
+    on_begin:
+      - lambda: |-
+          id(backlight_pwm).set_level(0.0f);
+    on_error:
+      - lambda: |-
+          id(backlight_pwm).set_level(id(backlight_brightness_pct) / 100.0f);
+    on_abort:
+      - lambda: |-
+          id(backlight_pwm).set_level(id(backlight_brightness_pct) / 100.0f);
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s
+
+# ============================================================================
+# Time — SNTP (NTP) clock shown in the header. Non-Home-Assistant source; kept
+# on the ESP32-S3 internal RTC between syncs (not battery-backed, so the header
+# shows --:-- until the first sync after boot). Default servers: pool.ntp.org.
+# The timezone is detected from the build host — see below.
+# ============================================================================
+time:
+  - platform: sntp
+    id: sntp_time
+    # timezone is deliberately omitted: ESPHome bakes in the zone of the machine
+    # running the compile (tzlocal, e.g. /etc/localtime). Set it explicitly here
+    # — timezone: Europe/Berlin — when the build host is in a different zone
+    # than the console, or when building somewhere with no host zone to detect
+    # (a bare container will silently give you UTC).
+
+# ============================================================================
+# I2C bus (JC8048W550C pinout)
+# ============================================================================
+i2c:
+  # GT911 touch controller (onboard). SDA/SCL per [A] and [B]. GPIO19/20 are
+  # also the ESP32-S3's native USB D-/D+ pins (unused here — USB-C goes via
+  # the CH340); see esphome/esphome#15356 if touch logs I2C timeouts.
+  - id: i2c_bus
+    sda: GPIO19
+    scl: GPIO20
+    frequency: 400000
+
+# No bambuddy_nfc: block — no PN532 fitted yet (see header).
+
+# ============================================================================
+# Sensors
+# ============================================================================
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_sensor
+    update_interval: 300s
+
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    update_interval: 300s
+
+# ============================================================================
+# Buttons
+# ============================================================================
+button:
+  - platform: template
+    name: "Tare Scale"
+    id: tare_button
+    on_press:
+      then:
+        - lambda: bambuddy->request_tare();
+
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+
+# ============================================================================
+# Backlight — JC8048W550C backlight PWM (GPIO2 per [A] and [B], 1220Hz per [A])
+# ============================================================================
+output:
+  - platform: ledc
+    pin: GPIO2
+    id: backlight_pwm
+    frequency: 1220Hz
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: display_backlight
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0ms
+
+# ============================================================================
+# Display — JC8048W550C 800x480 RGB565 parallel panel, DE mode with HSYNC/
+# VSYNC wired. Every pin and timing value below is identical in [A], [B]
+# and [C]. The panel has no reset line on a GPIO ([B]: DISP=NC), so unlike
+# the Panda Touch there is no reset_pin.
+# ============================================================================
+display:
+  - platform: mipi_rgb
+    model: RPI
+    id: main_display
+    update_interval: never
+    dimensions:
+      width: ${screen_width}
+      height: ${screen_height}
+    de_pin: GPIO40
+    hsync_pin: GPIO39
+    vsync_pin: GPIO41
+    pclk_pin: GPIO42
+    # 16MHz per [A], [B], [C]. If the image jitters/shimmers, users of this
+    # panel report 15.4MHz is steadier (rzeldent/esp32-smartdisplay#185).
+    pclk_frequency: 16MHz
+    pclk_inverted: true   # [A]; [B] PCLK_ACTIVE_NEG=true; also [C]'s default
+    hsync_pulse_width: 4
+    hsync_back_porch: 8
+    hsync_front_porch: 8
+    vsync_pulse_width: 4
+    vsync_back_porch: 8
+    vsync_front_porch: 8
+    color_order: RGB
+    invert_colors: true   # [A]
+    auto_clear_enabled: false
+    # [A] and [C] list these exact red/green/blue sets. ([B] labels the red
+    # and blue sets the other way round, but that is only its esp_lcd
+    # LSB-first bit naming — same physical wiring.) GPIO3/45/46 are strapping
+    # pins; mipi_rgb auto-sets ignore_strapping_warning on bare data-pin
+    # entries, which is correct: they are only sampled at reset, long before
+    # the RGB peripheral drives them.
+    data_pins:
+      red:
+        - GPIO45  # R3 (strapping)
+        - GPIO48  # R4
+        - GPIO47  # R5
+        - GPIO21  # R6
+        - GPIO14  # R7
+      green:
+        - GPIO5   # G2
+        - GPIO6   # G3
+        - GPIO7   # G4
+        - GPIO15  # G5
+        - GPIO16  # G6
+        - GPIO4   # G7
+      blue:
+        - GPIO8   # B3
+        - GPIO3   # B4 (strapping)
+        - GPIO46  # B5 (strapping)
+        - GPIO9   # B6
+        - GPIO1   # B7
+
+# ============================================================================
+# Touch — GT911 (JC8048W550C pinout)
+# ============================================================================
+touchscreen:
+  - platform: gt911
+    id: touch_screen
+    i2c_id: i2c_bus
+    address: 0x5D         # [A] and [B]
+    # No interrupt_pin/reset_pin, matching the known-working ESPHome config
+    # [A], so the GT911 is polled. ([B] lists INT=GPIO18, RST=GPIO38, but that
+    # is unverified on ESPHome with this board.)
+    update_interval: 16ms # [A]
+    on_touch:
+      - lambda: |-
+          id(display_backlight).turn_on()
+            .set_brightness(id(backlight_brightness_pct) / 100.0f)
+            .set_transition_length(0).perform();
+
+# ============================================================================
+# BambuddyAPI — No speaker on JC8048W550C, so speaker_id is omitted
+# ============================================================================
+bambuddy_api:
+  id: bambuddy
+  backend_url: !secret bambuddy_backend_url   # Bambuddy server base URL, e.g. http://192.168.1.50:5000
+  api_key: !secret bambuddy_api_key           # from Bambuddy → Settings → Devices → this device's API key
+  hostname: "SpoolBuddy-Console-JC8048W550C"  # display name for this device in Bambuddy's device list (not the network/mDNS hostname)
+  backlight_id: display_backlight             # id of the `light:` below — dimmed/turned off by the sleep state machine
+  heartbeat_interval: 10        # seconds — tag scan triggers an extra immediate heartbeat
+  # heartbeat_fail_threshold: 3   # consecutive failed heartbeats before cloud/WiFi icons go red (default: 3)
+  printer_poll_interval: 15     # seconds between AMS/printer status polls to Bambuddy
+  sleep_factor: 12               # heartbeat/poll multiplier while asleep (×12: 10s→120s, 15s→180s); sleep_timeout set at runtime in app.yaml
