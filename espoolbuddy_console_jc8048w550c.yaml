@@ -63,7 +63,16 @@ esp32:
       CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
       CONFIG_PM_ENABLE: "y"
       CONFIG_FREERTOS_USE_TICKLESS_IDLE: "1"
+      # mipi_rgb refreshes the panel from PSRAM through bounce buffers. If a
+      # refill misses its deadline the DMA desyncs and the image stays shifted
+      # (seen here as the header's top rows appearing along the bottom edge);
+      # this makes the driver re-sync at the next VSYNC. See ESP-IDF rgb_lcd docs.
+      CONFIG_LCD_RGB_RESTART_IN_VSYNC: "y"
     advanced:
+      # PSRAM XIP (CONFIG_SPIRAM_XIP_FROM_PSRAM), per [A]. ESP-IDF strongly
+      # recommends it with bounce buffers: code/rodata run from PSRAM, so the
+      # cache stays up during flash writes (NVS, OTA) and refills aren't stalled.
+      execute_from_psram: true
       # ESPHome's own "loopTask" (esp32/core.cpp) runs setup()/App.loop() —
       # including lv_timer_handler() and every interval lambda — on a
       # statically-sized stack independent of ESP-IDF's main-task stack
